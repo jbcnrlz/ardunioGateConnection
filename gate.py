@@ -3,7 +3,8 @@ import requests
 import time
 import json
 from datetime import datetime
-import serial.tools.list_ports
+import sys
+import glob
 
 # --- CONFIGURAÇÃO ---
 BAUD_RATE = 9600
@@ -93,50 +94,52 @@ class GerenciadorPortas:
         self.serial_connection = None
     
     def listar_portas_disponiveis(self):
-        """Lista todas as portas COM disponíveis"""
-        print("\n🔎 Escaneando portas COM disponíveis...")
+        """Lista todas as portas COM disponíveis (funciona em Windows, Linux e macOS)"""
+        print("\n🔎 Escaneando portas seriais disponíveis...")
         portas = []
         
-        for porta in serial.tools.list_ports.comports():
-            portas.append({
-                'device': porta.device,
-                'description': porta.description,
-                'hwid': porta.hwid
-            })
-            print(f"   📍 {porta.device} - {porta.description}")
+        # Detecta o sistema operacional
+        if sys.platform.startswith('win'):
+            # Windows - portas COM
+            portas = [f"COM{i}" for i in range(1, 256)]
+        elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
+            # Linux - /dev/ttyUSB*, /dev/ttyACM*
+            portas = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+        elif sys.platform.startswith('darwin'):
+            # macOS - /dev/tty.usb*, /dev/tty.cu*
+            portas = glob.glob('/dev/tty.usb*') + glob.glob('/dev/tty.cu*')
+        else:
+            print(f"⚠️  Sistema operacional não suportado: {sys.platform}")
+            return []
         
-        return portas
+        portas_validas = []
+        for porta in portas:
+            if self.verificar_porta_existe(porta):
+                portas_validas.append(porta)
+                print(f"   📍 {porta}")
+        
+        if not portas_validas:
+            print("   ❌ Nenhuma porta serial encontrada")
+        
+        return portas_validas
     
-    def detectar_porta_arduino(self):
-        """Tenta detectar automaticamente a porta do Arduino"""
-        print("\n🎯 Procurando Arduino...")
-        
-        # Padrões comuns de descrição do Arduino
-        padroes_arduino = [
-            'arduino', 'Arduino', 'CH340', 'USB Serial', 'USB-to-Serial',
-            'Serial-USB', 'USB2.0-Serial', 'FT232R', 'CP210'
-        ]
-        
-        for porta in serial.tools.list_ports.comports():
-            descricao = porta.description.upper()
-            dispositivo = porta.device
-            
-            # Verifica se a descrição contém algum padrão do Arduino
-            for padrao in padroes_arduino:
-                if padrao.upper() in descricao:
-                    print(f"✅ Arduino detectado: {dispositivo} - {porta.description}")
-                    return dispositivo
-        
-        # Se não encontrou por descrição, retorna a primeira porta disponível
-        portas = [porta.device for porta in serial.tools.list_ports.comports()]
-        if portas:
-            print(f"⚠️  Arduino não detectado automaticamente. Usando primeira porta: {portas[0]}")
-            return portas[0]
-        
-        return None
+    def verificar_porta_existe(self, porta):
+        """Verifica se uma porta serial existe e está acessível"""
+        try:
+            if sys.platform.startswith('win'):
+                # No Windows, tenta abrir a porta para verificar se existe
+                ser = serial.Serial(porta)
+                ser.close()
+                return True
+            else:
+                # No Linux/macOS, verifica se o arquivo do dispositivo existe
+                import os
+                return os.path.exists(porta)
+        except:
+            return False
     
-    def testar_porta(self, porta):
-        """Testa se a porta é válida e responde como Arduino"""
+    def testar_porta_arduino(self, porta):
+        """Testa se a porta é um Arduino enviando dados DHT11"""
         print(f"🧪 Testando porta: {porta}")
         
         try:
@@ -151,10 +154,12 @@ class GerenciadorPortas:
             while time.time() - inicio_tempo < 5:  # Timeout de 5 segundos
                 if ser.in_waiting > 0:
                     linha = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if linha and linha.startswith('UMD:'):
-                        print(f"✅ Porta {porta} válida! Recebido: {linha}")
-                        ser.close()
-                        return True
+                    if linha:
+                        print(f"   📨 Dados recebidos: {linha}")
+                        if linha.startswith('UMD:'):
+                            print(f"✅ Porta {porta} válida! Arduino detectado.")
+                            ser.close()
+                            return True
                 time.sleep(0.1)
             
             ser.close()
@@ -164,38 +169,27 @@ class GerenciadorPortas:
         except serial.SerialException as e:
             print(f"❌ Erro na porta {porta}: {e}")
             return False
+        except Exception as e:
+            print(f"❌ Erro inesperado na porta {porta}: {e}")
+            return False
     
     def conectar_automaticamente(self):
         """Conecta automaticamente à porta do Arduino"""
         portas_disponiveis = self.listar_portas_disponiveis()
         
         if not portas_disponiveis:
-            print("❌ Nenhuma porta COM encontrada!")
+            print("❌ Nenhuma porta serial encontrada!")
             print("   Verifique:")
             print("   - Se o Arduino está conectado via USB")
             print("   - Se o driver CH340/FTDI está instalado")
-            print("   - Se a porta não está sendo usada por outro programa")
+            print("   - Se o cabo USB está funcionando")
             return None
         
-        # Tenta detectar Arduino automaticamente
-        porta_arduino = self.detectar_porta_arduino()
+        print("\n🎯 Procurando Arduino...")
         
-        if porta_arduino:
-            if self.testar_porta(porta_arduino):
-                try:
-                    self.serial_connection = serial.Serial(porta_arduino, self.baud_rate, timeout=1)
-                    time.sleep(2)
-                    self.porta_atual = porta_arduino
-                    print(f"🎉 Conectado com sucesso à porta: {porta_arduino}")
-                    return self.serial_connection
-                except serial.SerialException as e:
-                    print(f"❌ Erro ao conectar com {porta_arduino}: {e}")
-        
-        # Se não encontrou automaticamente, testa todas as portas
-        print("\n🔍 Testando todas as portas disponíveis...")
-        for porta_info in portas_disponiveis:
-            porta = porta_info['device']
-            if self.testar_porta(porta):
+        # Testa cada porta disponível
+        for porta in portas_disponiveis:
+            if self.testar_porta_arduino(porta):
                 try:
                     self.serial_connection = serial.Serial(porta, self.baud_rate, timeout=1)
                     time.sleep(2)
@@ -205,7 +199,11 @@ class GerenciadorPortas:
                 except serial.SerialException as e:
                     print(f"❌ Erro ao conectar com {porta}: {e}")
         
-        print("❌ Não foi possível conectar a nenhuma porta")
+        print("❌ Não foi possível encontrar o Arduino em nenhuma porta")
+        print("   Verifique se:")
+        print("   - O Arduino está com o sketch correto carregado")
+        print("   - O Arduino está enviando dados no formato 'UMD:|TMP:'")
+        print("   - A taxa de baud está correta (9600)")
         return None
     
     def reconectar(self):
@@ -295,16 +293,13 @@ def iniciar_proxy():
     # Conecta automaticamente ao Arduino
     ser = gerenciador_portas.conectar_automaticamente()
     if not ser:
-        print("❌ Não foi possível conectar ao Arduino. Verifique:")
-        print("   - Se o Arduino está conectado via USB")
-        print("   - Se o sketch está rodando no Arduino")
-        print("   - Se a taxa de Baud está correta (9600)")
+        print("❌ Não foi possível conectar ao Arduino.")
         return
     
     contador_leitura = 0
     contador_erros_firebase = 0
     contador_sem_dados = 0
-    max_sem_dados = 10  # Reconecta se ficar muito tempo sem dados
+    max_sem_dados = 1000  # Aproximadamente 10 segundos
     
     print("\n📊 Iniciando captura de dados...")
     print("-" * 50)
@@ -339,10 +334,11 @@ def iniciar_proxy():
             else:
                 contador_sem_dados += 1
                 # Se ficou muito tempo sem dados, tenta reconectar
-                if contador_sem_dados > max_sem_dados * 10:  # Aprox. 10 segundos
+                if contador_sem_dados > max_sem_dados:
                     print("🔄 Muito tempo sem dados. Tentando reconectar...")
                     ser = gerenciador_portas.reconectar()
                     if not ser:
+                        print("❌ Não foi possível reconectar. Encerrando...")
                         break
                     contador_sem_dados = 0
             
@@ -357,21 +353,22 @@ def iniciar_proxy():
             ser.close()
             print("🔌 Porta serial fechada")
 
-# Função para teste rápido das portas
-def teste_rapido_portas():
-    """Função para testar rapidamente as portas disponíveis"""
+# Versão simplificada para teste rápido
+def teste_deteccao_portas():
+    """Testa apenas a detecção de portas"""
+    print("🧪 TESTE DE DETECÇÃO DE PORTAS")
     gerenciador = GerenciadorPortas(BAUD_RATE)
-    gerenciador.listar_portas_disponiveis()
-    porta = gerenciador.detectar_porta_arduino()
-    if porta:
-        print(f"\n🎯 Porta sugerida: {porta}")
-        if gerenciador.testar_porta(porta):
-            print("✅ Porta testada com sucesso!")
-        else:
-            print("❌ Porta não respondeu")
+    portas = gerenciador.listar_portas_disponiveis()
+    
+    if portas:
+        print(f"\n🎯 Testando {len(portas)} porta(s)...")
+        for porta in portas:
+            gerenciador.testar_porta_arduino(porta)
+    else:
+        print("❌ Nenhuma porta encontrada para teste")
 
 if __name__ == "__main__":
     # Descomente a linha abaixo para testar apenas a detecção de portas
-    # teste_rapido_portas()
+    # teste_deteccao_portas()
     
     iniciar_proxy()
